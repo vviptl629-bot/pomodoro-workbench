@@ -584,7 +584,7 @@ function wakeOn(){
   }catch(e){}
 }
 function wakeOff(){
-  try{ if(wakeLock) wakeLock.release(); }catch(e){}
+  try{ if(wakeLock) wakeLock.release(); }catch(e){}   // 到点后立刻释放，别让屏幕一直亮着
   wakeLock = null; refreshChecks();
 }
 function mediaOn(){
@@ -730,6 +730,7 @@ function finishSession(overdueMs){
   st.remain = 0;
   st.overdue = ov;
 
+  st.hiddenAtFire = document.visibilityState !== "visible";
   keepAliveOff(); wakeOff(); mediaOff();
   cancelTrigger();
   clearRT();
@@ -851,8 +852,18 @@ function refreshChecks(){
     !data.settings.keepAlive ? "已关闭（锁屏后可能被系统冻结）" : (kaOn ? "播放中 · 系统视本应用为「正在播放媒体」" : "未播放（点「开始」后启动）")));
 
   // 4 屏幕唤醒锁
-  var wl = ("wakeLock" in navigator) ? (wakeLock ? "已获取 · 计时期间不自动熄屏" : "未获取（开始计时后自动申请）") : "此浏览器不支持";
-  it.push(chk(wakeLock ? "ok" : (("wakeLock" in navigator) ? "warn":"warn"), "屏幕唤醒锁", wl));
+  var wl;
+  if(!("wakeLock" in navigator)) wl = "此浏览器不支持";
+  else if(wakeLock && !wakeLock.released) wl = "已获取 · 计时期间不自动熄屏";
+  else if(st.running) wl = "未获取（系统可能在省电模式下拒绝，回前台会自动重申请）";
+  else wl = "未获取（开始计时后自动申请）";
+  it.push(chk(wakeLock && !wakeLock.released ? "ok" : "warn", "屏幕唤醒锁", wl));
+
+  // 桌面端如实说明：桌面浏览器没有系统通知通道，锁屏后无法出声
+  var isDesktop = !/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+  if(isDesktop){
+    it.push(chk("warn", "桌面端限制", "桌面浏览器没有系统通知通道，系统锁屏后网页会被冻结 → 解锁后补响。手机端才有锁屏弹窗。"));
+  }
 
   // 5 音频通道
   var sess = "";
@@ -892,7 +903,8 @@ function showEndModal(sess, overdueMs){
   $("emTitle").textContent = "⏰ " + m.name + " 到";
   var meta = fmtClock(sess.start) + " – " + fmtClock(sess.end) + " · 共 " + sess.minutes + " 分钟";
   if(overdueMs > 60000){
-    meta += '<br><span class="warnline">应用被系统冻结，延迟 ' + Math.round(overdueMs/60000) + " 分钟才补响；这一局已按原定结束时间记录。</span>";
+    var why = st.hiddenAtFire ? "页面在后台被系统限速" : "计时期间系统进入锁屏/休眠";
+    meta += '<br><span class="warnline">' + why + '，延迟 ' + Math.round(overdueMs/60000) + " 分钟才补响；这一局已按原定结束时间记录。</span>";
   }
   $("emMeta").innerHTML = meta;
   $("emNote").value = "";
@@ -1116,10 +1128,33 @@ document.addEventListener("keydown", function(e){
   if(e.key === "r" || e.key === "R") doReset();
 });
 
+/* 系统锁屏探测：Web Locks 的锁在锁屏时会被强制释放，据此可确认"确实锁过屏" */
+var lockProbe = { supported:false, everReleased:false };
+(function(){
+  try{
+    if(!navigator.locks || !navigator.locks.request) return;
+    lockProbe.supported = true;
+    navigator.locks.request("pomo-probe", { mode:"exclusive" }, function(){
+      return new Promise(function(resolve){
+        // 一直持有；被系统强制打断时说明发生了锁屏/休眠
+        document.addEventListener("visibilitychange", function(){
+          if(document.visibilityState !== "visible") lockProbe.everReleased = true;
+        });
+        setTimeout(resolve, 2147483647);
+      });
+    }).catch(function(){
+      lockProbe.everReleased = true;   // 被强制夺走 = 系统休眠过
+    });
+    navigator.locks.addEventListener && navigator.locks.addEventListener("lock", function(){});
+  }catch(e){}
+})();
+
 /* 每次回到前台：重新申请唤醒锁 + 补算 */
+/* 部分系统会自动释放唤醒锁（用户熄屏、切省电模式）。加个闸：只在计时中且页面可见时重申请 */
+function wakeOnSafe(){ if(st.running && document.visibilityState === "visible") wakeOn(); }
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){
-    if(st.running){ wakeOn(); if($("keepAudio").paused) keepAliveOn(); }
+    if(st.running){ wakeOnSafe(); if($("keepAudio").paused) keepAliveOn(); }
     if(document.body.classList.contains("ringing")){
       var raV = $("ringAudio");
       if(raV.paused){ try{ raV.currentTime=0; raV.play().then(function(){ ringBlocked=false; hideRingHint(); }).catch(function(){}); }catch(e){} }
